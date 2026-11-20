@@ -1,0 +1,19 @@
+{
+  "controlRepository": "avnish910242-ai/uda-control",
+  "projects": [
+    {
+      "name": "AI Knowledge Vault",
+      "repository": "avnish910242-ai/ai-knowledge-vault",
+      "branch": "main",
+      "renderOwnerId": "tea-datj5ko93c1s73aqr65g",
+      "renderServiceName": "ai-knowledge-vault",
+      "runtime": {
+        "type": "node",
+        "version": "24"
+      },
+      "install": [["npm", "ci"]],
+      "build": [["npm", "run", "build"]],
+      "test": [["npm", "run", "lint"]]
+    }
+  ]
+}

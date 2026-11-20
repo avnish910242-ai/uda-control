@@ -1,0 +1,408 @@
+name: UDA cloud validation and Render deployment
+run-name: UDA ${{ inputs.project }} ${{ inputs.commit }} ${{ inputs.nonce }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      project:
+        description: Registered project name
+        required: true
+        type: string
+      commit:
+        description: Exact latest GitHub branch commit approved for deployment
+        required: true
+        type: string
+      issued_at:
+        description: Unix timestamp from the approved local deployment process
+        required: true
+        type: string
+      nonce:
+        description: One-time random approval identifier
+        required: true
+        type: string
+      approval_signature:
+        description: HMAC attestation for the approved deployment target
+        required: true
+        type: string
+
+concurrency:
+  group: uda-deploy-${{ inputs.project }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  control-ref-guard:
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Reject non-production control refs
+        env:
+          CONTROL_REF: ${{ github.ref }}
+        run: |
+          if [ "$CONTROL_REF" != "refs/heads/main" ]; then
+            echo 'Deployment workflow must run from protected control branch main.' >&2
+            exit 1
+          fi
+
+  validate-and-deploy:
+    needs: control-ref-guard
+    if: github.ref == 'refs/heads/main' && needs.control-ref-guard.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    environment:
+      name: uda-production
+    steps:
+      - name: Check out the deployment allowlist
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # actions/checkout v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Verify authorization and project mapping
+        id: map
+        env:
+          PROJECT_NAME: ${{ inputs.project }}
+          COMMIT_SHA: ${{ inputs.commit }}
+          ISSUED_AT: ${{ inputs.issued_at }}
+          NONCE: ${{ inputs.nonce }}
+          APPROVAL_SIGNATURE: ${{ inputs.approval_signature }}
+          APPROVAL_KEY: ${{ secrets.UDA_APPROVAL_HMAC_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+          API_URL: ${{ github.api_url }}
+          REPOSITORY: ${{ github.repository }}
+          CONTROL_REF: ${{ github.ref }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          node <<'NODE'
+          const fs = require('fs');
+          const https = require('https');
+          const crypto = require('crypto');
+          const fail = message => { console.error(message); process.exit(1); };
+          const config = JSON.parse(fs.readFileSync('config/deployments.json', 'utf8'));
+          const { PROJECT_NAME: name, COMMIT_SHA: sha, ISSUED_AT: issued, NONCE: nonce,
+            APPROVAL_SIGNATURE: signature, APPROVAL_KEY: key, API_URL: apiUrl,
+            REPOSITORY: repo, CONTROL_REF: controlRef, RUN_ID: runId, RUN_ATTEMPT: runAttempt } = process.env;
+          if (controlRef !== 'refs/heads/main') fail('Deployment workflow must run from protected control branch main.');
+          if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(config.controlRepository || '') || config.controlRepository !== repo) fail('Control repository does not match the configured allowlist.');
+          if (!/^[0-9a-f]{40}([0-9a-f]{24})?$/i.test(sha || '') || !/^\d{10}$/.test(issued || '') || !/^[0-9a-f]{64}$/.test(nonce || '') || !/^[0-9a-f]{64}$/.test(signature || '')) fail('Invalid deployment attestation fields.');
+          if (!key || Buffer.byteLength(key, 'utf8') < 32) fail('Approval verification key is not configured.');
+          if (runAttempt !== '1') fail('Workflow reruns are not authorized.');
+          const age = Math.floor(Date.now() / 1000) - Number(issued);
+          if (age < -30 || age > 300) fail('Deployment attestation is expired or from the future.');
+          const matches = (config.projects || []).filter(p => p.name === name);
+          if (matches.length !== 1) fail('Project is not allowlisted exactly once.');
+          const p = matches[0];
+          if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(p.repository || '') ||
+              !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(p.branch || '') ||
+              !/^tea-[a-z0-9]+$/.test(p.renderOwnerId || '') ||
+              !/^[a-z0-9][a-z0-9-]{1,62}$/.test(p.renderServiceName || '') ||
+              !p.runtime || !['node','python','static'].includes(p.runtime.type) ||
+              (p.runtime.type !== 'static' && !/^\d+(\.\d+){0,2}$/.test(p.runtime.version || '')) ||
+              !Array.isArray(p.install) || !Array.isArray(p.build) || !p.build.length || !Array.isArray(p.test) || !p.test.length) fail('Invalid project allowlist entry.');
+          const validCommandList = (commands, required) => Array.isArray(commands) && (!required || commands.length > 0) &&
+            commands.every(command => Array.isArray(command) && command.length > 0 &&
+              command.every(value => typeof value === 'string' && value.trim().length > 0 && !/[\u0000-\u001f\u007f]/.test(value)) &&
+              !/[;&|<>`$]/.test(command[0]));
+          if (!validCommandList(p.install, false) || !validCommandList(p.build, true) || !validCommandList(p.test, true)) fail('Invalid project command lists.');
+          const canonicalFields = values => values.map(value => { const s = String(value); return `${Buffer.byteLength(s, 'utf8')}:${s}`; }).join('');
+          const mappingFields = ['name', p.name, 'repository', p.repository, 'branch', p.branch,
+            'renderOwnerId', p.renderOwnerId, 'renderServiceName', p.renderServiceName,
+            'runtime.type', p.runtime.type, 'runtime.version', p.runtime.version || ''];
+          for (const keyName of ['install', 'build', 'test']) {
+            mappingFields.push(`${keyName}.command-count`, String(p[keyName].length));
+            p[keyName].forEach((command, index) => mappingFields.push(`${keyName}.${index}.argument-count`, String(command.length), ...command));
+          }
+          const mappingIdentity = crypto.createHash('sha256').update(canonicalFields(mappingFields), 'utf8').digest('hex');
+          if (p.name !== name || p.repository !== 'avnish910242-ai/ai-knowledge-vault' || p.branch !== 'main' || p.renderServiceName !== 'ai-knowledge-vault' || p.runtime.type !== 'node' || p.install.length !== 1 || JSON.stringify(p.install[0]) !== JSON.stringify(['npm','ci']) || p.build.length !== 1 || JSON.stringify(p.build[0]) !== JSON.stringify(['npm','run','build']) || p.test.length !== 1 || JSON.stringify(p.test[0]) !== JSON.stringify(['npm','run','lint'])) fail('AI Knowledge Vault deployment mapping does not match the approved target.');
+          const canonical = canonicalFields([name, p.repository, p.branch, sha.toLowerCase(), issued, nonce,
+            config.controlRepository, controlRef, mappingIdentity]);
+          const expected = crypto.createHmac('sha256', key).update(canonical, 'utf8').digest();
+          const supplied = Buffer.from(signature, 'hex');
+          if (supplied.length !== expected.length || !crypto.timingSafeEqual(supplied, expected)) fail('Deployment attestation is invalid.');
+          const runName = `UDA ${name} ${sha} ${nonce}`;
+          function getRuns(page) {
+            return new Promise((resolve, reject) => {
+              const url = new URL(`${apiUrl}/repos/${repo}/actions/workflows/uda-cloud-validation.yml/runs?per_page=100&page=${page}`);
+              const req = https.request(url, { headers: { accept: 'application/vnd.github+json', authorization: `Bearer ${process.env.GITHUB_TOKEN}`, 'x-github-api-version': '2022-11-28' } }, res => {
+                let data = '';
+                res.on('data', chunk => { data += chunk; if (data.length > 1000000) req.destroy(new Error('Response too large.')); });
+                res.on('end', () => {
+                  if (res.statusCode !== 200) return reject(new Error('Run list unavailable.'));
+                  try {
+                    const runs = JSON.parse(data).workflow_runs;
+                    if (!Array.isArray(runs)) return reject(new Error('Run list invalid.'));
+                    resolve(runs);
+                  } catch { reject(new Error('Run list invalid.')); }
+                });
+              });
+              req.on('error', reject);
+              req.end();
+            });
+          }
+          (async () => {
+            const recentRuns = [];
+            const cutoff = Number(issued) * 1000 - 60000;
+            let complete = false;
+            for (let page = 1; page <= 10; page++) {
+              const pageRuns = await getRuns(page);
+              recentRuns.push(...pageRuns);
+              const oldest = pageRuns.length ? Date.parse(pageRuns[pageRuns.length - 1].created_at) : 0;
+              if (pageRuns.length < 100 || oldest < cutoff) { complete = true; break; }
+            }
+            if (!complete) fail('Too many recent workflow runs to verify replay protection safely.');
+            const sameAuthorization = recentRuns.filter(r => r.display_title === runName);
+            if (sameAuthorization.length !== 1 || String(sameAuthorization[0].id) !== runId) fail('Approval authorization was already used or run identity is invalid.');
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, `mapping=${Buffer.from(JSON.stringify(p)).toString('base64')}\n`);
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, `repository=${p.repository}\nbranch=${p.branch}\nruntime_type=${p.runtime.type}\nruntime_version=${p.runtime.version || ''}\n`);
+          })().catch(() => fail('Could not verify one-time deployment authorization.'));
+          NODE
+
+      - name: Check out the exact authorized project commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # actions/checkout v4.2.2
+        with:
+          repository: ${{ steps.map.outputs.repository }}
+          ref: ${{ inputs.commit }}
+          path: project
+          fetch-depth: 0
+          token: ${{ secrets.UDA_PROJECT_READ_TOKEN }}
+          persist-credentials: false
+
+      - name: Verify exact pushed branch head
+        env:
+          TARGET_BRANCH: ${{ steps.map.outputs.branch }}
+          COMMIT_SHA: ${{ inputs.commit }}
+        run: |
+          actual="$(git -C project rev-parse "refs/remotes/origin/$TARGET_BRANCH")"
+          if [ "$actual" != "$COMMIT_SHA" ]; then
+            echo 'The authorized commit is not the exact current head of the allowlisted branch.' >&2
+            exit 1
+          fi
+
+      - name: Set up Node.js
+        if: steps.map.outputs.runtime_type == 'node'
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # actions/setup-node v4.4.0
+        with:
+          node-version: ${{ steps.map.outputs.runtime_version }}
+
+      - name: Set up Python
+        if: steps.map.outputs.runtime_type == 'python'
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # actions/setup-python v5.6.0
+        with:
+          python-version: ${{ steps.map.outputs.runtime_version }}
+
+      - name: Install dependencies, build, and test
+        env:
+          PROJECT_MAPPING_B64: ${{ steps.map.outputs.mapping }}
+        run: |
+          node <<'NODE'
+          const { spawnSync } = require('child_process');
+          const p = JSON.parse(Buffer.from(process.env.PROJECT_MAPPING_B64, 'base64').toString('utf8'));
+          for (const [label, commands] of [['dependency installation', p.install], ['build', p.build], ['test', p.test]]) {
+            for (const command of commands) {
+              const result = spawnSync(command[0], command.slice(1), { cwd: 'project', stdio: 'inherit', shell: false });
+              if (result.error) throw new Error(`${label} could not start: ${result.error.message}`);
+              if (result.status !== 0) throw new Error(`${label} failed with exit code ${result.status}`);
+            }
+          }
+          NODE
+
+      - name: Recheck the exact source branch head before deployment
+        env:
+          PROJECT_MAPPING_B64: ${{ steps.map.outputs.mapping }}
+          PROJECT_READ_TOKEN: ${{ secrets.UDA_PROJECT_READ_TOKEN }}
+          API_URL: ${{ github.api_url }}
+          COMMIT_SHA: ${{ inputs.commit }}
+        run: |
+          node <<'NODE'
+          const https = require('https');
+          const p = JSON.parse(Buffer.from(process.env.PROJECT_MAPPING_B64, 'base64').toString('utf8'));
+          if (!process.env.PROJECT_READ_TOKEN) throw new Error('Project read credential is not configured.');
+          const url = new URL(`${process.env.API_URL}/repos/${p.repository}/branches/${encodeURIComponent(p.branch)}`);
+          const req = https.request(url, { headers: { accept: 'application/vnd.github+json', authorization: `Bearer ${process.env.PROJECT_READ_TOKEN}` } }, res => {
+            let data = '';
+            res.on('data', chunk => { data += chunk; if (data.length > 1000000) req.destroy(new Error('Response too large.')); });
+            res.on('end', () => {
+              if (res.statusCode !== 200) { console.error('Could not recheck the source branch before deployment.'); process.exit(1); }
+              let latest;
+              try { latest = JSON.parse(data).commit.sha; } catch { console.error('Source branch response was invalid.'); process.exit(1); }
+              if (latest !== process.env.COMMIT_SHA) { console.error('Source branch moved after cloud validation; Render deployment blocked.'); process.exit(1); }
+            });
+          });
+          req.on('error', () => { console.error('Could not recheck the source branch before deployment.'); process.exit(1); });
+          req.end();
+          NODE
+
+      - name: Deploy to Render and verify live site
+        if: success()
+        env:
+          PROJECT_NAME: ${{ inputs.project }}
+          COMMIT_SHA: ${{ inputs.commit }}
+          PROJECT_MAPPING_B64: ${{ steps.map.outputs.mapping }}
+          RENDER_API_TOKEN: ${{ secrets.RENDER_API_TOKEN }}
+        run: |
+          node <<'NODE'
+          const fs = require('fs');
+          const https = require('https');
+          const { setTimeout: delay } = require('timers/promises');
+          const p = JSON.parse(Buffer.from(process.env.PROJECT_MAPPING_B64, 'base64').toString('utf8'));
+          const token = process.env.RENDER_API_TOKEN;
+          if (!token) throw new Error('Render API credential is not configured.');
+          const api = 'https://api.render.com/v1';
+          const wantedRepo = `https://github.com/${p.repository}`;
+          function request(method, target, body, renderApi = true) {
+            return new Promise((resolve, reject) => {
+              const u = new URL(target);
+              if (u.protocol !== 'https:' || (renderApi && u.hostname !== 'api.render.com')) return reject(new Error('HTTPS request URL rejected.'));
+              const payload = body === undefined ? null : JSON.stringify(body);
+              const headers = { accept: 'application/json', ...(renderApi ? { authorization: `Bearer ${token}` } : {}), ...(payload ? { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) } : {}) };
+              const req = https.request(u, { method, headers }, res => {
+                let data = '';
+                res.on('data', chunk => { data += chunk; if (data.length > 1000000) req.destroy(new Error('Response too large.')); });
+                res.on('end', () => {
+                  if (res.statusCode < 200 || res.statusCode >= 300) return reject(new Error(`${renderApi ? 'Render API' : 'Live URL'} returned HTTP ${res.statusCode}.`));
+                  if (!renderApi) return resolve({ statusCode: res.statusCode });
+                  if (!data) return resolve({});
+                  try { resolve(JSON.parse(data)); } catch { reject(new Error('Render API returned invalid JSON.')); }
+                });
+              });
+              req.setTimeout(20000, () => req.destroy(new Error('Request timed out.')));
+              req.on('error', () => reject(new Error('Render API request failed.')));
+              req.end(payload || undefined);
+            });
+          }
+          const serviceListUrl = () => `${api}/services?name=${encodeURIComponent(p.renderServiceName)}&ownerId=${encodeURIComponent(p.renderOwnerId)}&limit=100&includePreviews=false`;
+          async function findExactServices() {
+            const found = [];
+            let target = serviceListUrl();
+            for (let page=0; page<20; page++) {
+              const entries = await request('GET', target);
+              if (!Array.isArray(entries)) throw new Error('Render service lookup returned an invalid response.');
+              for (const entry of entries) {
+                const service = entry.service || entry;
+                if (service.name === p.renderServiceName && service.ownerId === p.renderOwnerId) found.push(service);
+              }
+              const cursor = entries.length ? entries[entries.length-1].cursor : null;
+              if (!cursor) return found;
+              const next = new URL(serviceListUrl()); next.searchParams.set('cursor', cursor); target = next.href;
+            }
+            throw new Error('Render service lookup exceeded its safe pagination limit.');
+          }
+          async function lookupOne() {
+            const found = await findExactServices();
+            if (found.length > 1) throw new Error('Multiple exact-name Render services exist; refusing to choose one.');
+            return found[0] || null;
+          }
+          async function verifyService(service) {
+            const d = service.serviceDetails || service;
+            const envDetails = d.envSpecificDetails;
+            const autoOff = service.autoDeployTrigger === 'off' || service.autoDeploy === 'no';
+            if (service.name !== p.renderServiceName || service.ownerId !== p.renderOwnerId || service.type !== 'web_service' ||
+                service.repo !== wantedRepo || service.branch !== p.branch || !autoOff || d.runtime !== 'node' ||
+                !envDetails || envDetails.buildCommand !== 'npm ci && npm run build' || envDetails.startCommand !== 'npm run start') {
+              throw new Error('An exact-name Render service exists but its repository, branch, Web Service type, Node runtime, commands, or auto-deploy setting does not match. It was not changed.');
+            }
+            const url = d.url || service.url;
+            let parsed;
+            try { parsed = new URL(url); } catch { throw new Error('Render service did not provide a canonical HTTPS URL.'); }
+            if (parsed.protocol !== 'https:' || parsed.username || parsed.password || parsed.search || parsed.hash || !parsed.hostname.endsWith('.onrender.com')) throw new Error('Render service did not provide a canonical HTTPS URL.');
+            if (typeof service.id !== 'string' || !/^srv-[A-Za-z0-9]+$/.test(service.id)) throw new Error('Render service ID was invalid.');
+            return { id: service.id, url: parsed.href };
+          }
+          const baseFor = id => `${api}/services/${encodeURIComponent(id)}/deploys`;
+          function commitOf(deploy) { return (typeof deploy.commit === 'string' ? deploy.commit : deploy.commit?.id) || deploy.commitId || deploy.deploy?.commit?.id || null; }
+          function statusOf(deploy) { return String(deploy.status || deploy.deploy?.status || '').toLowerCase(); }
+          async function deployments(serviceId) {
+            const result = await request('GET', `${baseFor(serviceId)}?limit=100`);
+            if (!Array.isArray(result)) throw new Error('Render deployment lookup returned an invalid response.');
+            return result.map(item => item.deploy || item);
+          }
+          function exactCandidate(items, sha) {
+            const latest = latestDeployment(items);
+            return latest && commitOf(latest)?.toLowerCase() === sha.toLowerCase() &&
+              (statusOf(latest) === 'live' || /(created|queued|pending|progress)/.test(statusOf(latest))) ? latest : null;
+          }
+          function latestDeployment(items) {
+            return [...items].sort((a,b) => Date.parse(b.createdAt || b.deploy?.createdAt || 0) - Date.parse(a.createdAt || a.deploy?.createdAt || 0))[0] || null;
+          }
+          async function waitForDeploy(serviceId, deployId, sha) {
+            if (typeof deployId !== 'string' || !deployId) throw new Error('Render did not return a deployment ID. No deployment retry was attempted.');
+            const base = baseFor(serviceId);
+            const deadline = Date.now() + 40 * 60 * 1000;
+            while (Date.now() < deadline) {
+              const response = await request('GET', `${base}/${encodeURIComponent(deployId)}`);
+              const deploy = response.deploy || response;
+              const status = statusOf(deploy);
+              const commit = commitOf(deploy);
+              if (commit && commit.toLowerCase() !== sha.toLowerCase()) throw new Error('Render deployment is not for the approved exact commit.');
+              if (status === 'live') {
+                if (!commit || commit.toLowerCase() !== sha.toLowerCase()) throw new Error('Render did not verify the deployed exact commit.');
+                return;
+              }
+              if (/(failed|canceled|cancelled|deactivated)/.test(status)) throw new Error(`Render deployment ended with status ${status || 'unknown'}.`);
+              await delay(10000);
+            }
+            throw new Error('Timed out waiting for Render deployment to become live.');
+          }
+          (async () => {
+            let service = await lookupOne();
+            let created = null;
+            let newlyCreated = false;
+            if (!service) {
+              const body = { type: 'web_service', name: p.renderServiceName, ownerId: p.renderOwnerId,
+                repo: wantedRepo, branch: p.branch, autoDeployTrigger: 'off',
+                serviceDetails: { runtime: 'node', envSpecificDetails: { buildCommand: 'npm ci && npm run build', startCommand: 'npm run start' } } };
+              try { created = await request('POST', `${api}/services`, body); newlyCreated = true; }
+              catch {
+                // A create timeout or conflict is ambiguous: reconcile exact-name first and never POST again here.
+                service = await lookupOne();
+                if (!service) throw new Error('Render service creation outcome is uncertain and exact-name reconciliation found no service. No retry was attempted.');
+                newlyCreated = true;
+              }
+              if (created) service = created.service || created;
+            }
+            const resolved = await verifyService(service);
+            let deployId = newlyCreated ? (created.deploy?.id || created.deployId) : null;
+            const current = await deployments(resolved.id);
+            const candidate = exactCandidate(current, process.env.COMMIT_SHA);
+            if (newlyCreated) {
+              if (!deployId && candidate) deployId = candidate.id;
+              for (let attempt=0; !deployId && attempt<12; attempt++) {
+                await delay(5000);
+                const appeared = exactCandidate(await deployments(resolved.id), process.env.COMMIT_SHA);
+                if (appeared) deployId = appeared.id;
+              }
+              if (!deployId) throw new Error('Service creation succeeded, but its first deployment could not be reconciled by exact commit. It will not create a duplicate deployment.');
+            } else if (candidate) {
+              deployId = candidate.id;
+            } else {
+              try {
+                const triggered = await request('POST', baseFor(resolved.id), { commitId: process.env.COMMIT_SHA });
+                deployId = triggered.id || triggered.deploy?.id;
+              } catch {
+                const reconciled = exactCandidate(await deployments(resolved.id), process.env.COMMIT_SHA);
+                if (reconciled) deployId = reconciled.id;
+                else throw new Error('Render deploy request outcome is uncertain and no matching deployment was found. No retry was attempted.');
+              }
+            }
+            await waitForDeploy(resolved.id, deployId, process.env.COMMIT_SHA);
+            const currentlyServing = latestDeployment(await deployments(resolved.id));
+            if (!currentlyServing || statusOf(currentlyServing) !== 'live' || commitOf(currentlyServing)?.toLowerCase() !== process.env.COMMIT_SHA.toLowerCase()) throw new Error('Render latest deployment does not confirm the approved SHA is currently live.');
+            const liveUrl = new URL(resolved.url);
+            const site = await request('GET', liveUrl.href, undefined, false);
+            void site;
+            fs.writeFileSync('deployment-result.json', JSON.stringify({ project: p.name, repository: p.repository, branch: p.branch, commit: process.env.COMMIT_SHA, renderServiceName: p.renderServiceName, renderServiceId: resolved.id, liveUrl: resolved.url }, null, 2), { mode: 0o600 });
+            console.log('Render deployment completed for the approved exact commit and the service HTTPS URL returned a successful response.');
+          })().catch(error => { console.error(error.message); process.exit(1); });
+          NODE
+
+      - name: Upload verified deployment result
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # actions/upload-artifact v4.6.2
+        with:
+          name: uda-deployment-result-${{ inputs.nonce }}
+          path: deployment-result.json
+          if-no-files-found: error
+          retention-days: 1

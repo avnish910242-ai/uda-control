@@ -1,0 +1,12 @@
+.uda/projects.json
+.uda/n8n-settings.json
+.uda/*
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+n8n/*credential*.json
+n8n/uda-phase2-workflow.json
