@@ -254,13 +254,7 @@ test('configuration errors do not disclose secret values and PORT is parsed stri
     return true;
   });
 
-  const validEnv = {
-    GITHUB_WEBHOOK_SECRET: SECRET,
-    GITHUB_REPOSITORY_ID: String(REPOSITORY_ID),
-    GITHUB_REPOSITORY_NAME: REPOSITORY_NAME,
-    GITHUB_BRANCH_REF: BRANCH_REF,
-    PORT: '8080',
-  };
+  const validEnv = { GITHUB_WEBHOOK_SECRET: SECRET, DATABASE_URL: 'postgres://offline', PORT: '8080' };
   assert.equal(readGitHubWebhookReceiverConfiguration(validEnv).port, 8080);
   assert.throws(() => readGitHubWebhookReceiverConfiguration({ ...validEnv, PORT: '8080junk' }), /configuration/);
 });
@@ -272,6 +266,7 @@ test('start binds to the PORT environment variable', async () => {
     host: '127.0.0.1',
     env: {
       GITHUB_WEBHOOK_SECRET: SECRET,
+      DATABASE_URL: 'postgres://offline',
       GITHUB_REPOSITORY_ID: String(REPOSITORY_ID),
       GITHUB_REPOSITORY_NAME: REPOSITORY_NAME,
       GITHUB_BRANCH_REF: BRANCH_REF,

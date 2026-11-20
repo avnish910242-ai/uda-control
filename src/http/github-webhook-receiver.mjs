@@ -1,6 +1,7 @@
 import { createServer } from 'node:http';
 
 import { enqueueVerifiedPush, DeploymentQueueError } from '../persistence/deployment-queue-repository.mjs';
+import { findActiveDeploymentTarget } from '../persistence/deployment-target-repository.mjs';
 import { createGitHubPushVerifier, WebhookVerificationError } from '../security/github-webhook-verifier.mjs';
 
 const WEBHOOK_PATH = '/github/webhook';
@@ -19,23 +20,12 @@ function parsePort(value) {
   return port;
 }
 
-function parseRepositoryId(value) {
-  if (typeof value !== 'string' || !/^\d+$/.test(value)) throw invalidConfiguration();
-  const repositoryId = Number(value);
-  if (!Number.isSafeInteger(repositoryId) || repositoryId <= 0) throw invalidConfiguration();
-  return repositoryId;
-}
-
 /** Reads receiver settings without including their values in validation errors. */
 export function readGitHubWebhookReceiverConfiguration(env = process.env) {
   if (!env || typeof env !== 'object') throw invalidConfiguration();
   const webhookSecret = env.GITHUB_WEBHOOK_SECRET;
-  const repositoryName = env.GITHUB_REPOSITORY_NAME;
-  const branchRef = env.GITHUB_BRANCH_REF;
   if (typeof webhookSecret !== 'string' || Buffer.byteLength(webhookSecret, 'utf8') < 32 ||
-      typeof repositoryName !== 'string' || typeof branchRef !== 'string') {
-    throw invalidConfiguration();
-  }
+      typeof env.DATABASE_URL !== 'string' || !env.DATABASE_URL.trim()) throw invalidConfiguration();
 
   let maxBodyBytes = DEFAULT_MAX_BODY_BYTES;
   if (env.GITHUB_WEBHOOK_MAX_BODY_BYTES !== undefined) {
@@ -50,9 +40,6 @@ export function readGitHubWebhookReceiverConfiguration(env = process.env) {
 
   return Object.freeze({
     webhookSecret,
-    repositoryId: parseRepositoryId(env.GITHUB_REPOSITORY_ID),
-    repositoryName,
-    branchRef,
     maxBodyBytes,
     port: parsePort(env.PORT ?? String(DEFAULT_PORT)),
   });
@@ -95,11 +82,11 @@ function assertPool(pool) {
 }
 
 /** Creates an HTTP server for a single configured repository/branch. */
-export function createGitHubWebhookReceiver({ pool, configuration }) {
+export function createGitHubWebhookReceiver({ pool, configuration, resolveTarget }) {
   assertPool(pool);
   let verifyPush;
   try {
-    verifyPush = createGitHubPushVerifier(configuration);
+    verifyPush = createGitHubPushVerifier({ ...configuration, ...(resolveTarget ? { resolveTarget } : {}) });
   } catch {
     throw invalidConfiguration();
   }
@@ -152,11 +139,9 @@ export async function startGitHubWebhookReceiver({ pool, env = process.env, host
     pool,
     configuration: {
       webhookSecret: settings.webhookSecret,
-      repositoryId: settings.repositoryId,
-      repositoryName: settings.repositoryName,
-      branchRef: settings.branchRef,
       maxBodyBytes: settings.maxBodyBytes,
     },
+    resolveTarget: identity => findActiveDeploymentTarget(pool, identity),
   });
 
   await new Promise((resolve, reject) => {

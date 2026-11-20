@@ -25,19 +25,15 @@ function validateConfiguration(configuration) {
     throw configurationError();
   }
 
-  const { webhookSecret, repositoryId, repositoryName, branchRef } = configuration;
+  const { webhookSecret, repositoryId, repositoryName, branchRef, resolveTarget, installationId } = configuration;
   if (typeof webhookSecret !== 'string' || Buffer.byteLength(webhookSecret, 'utf8') < 32) {
     throw configurationError();
   }
-  if (!Number.isSafeInteger(repositoryId) || repositoryId <= 0) {
-    throw configurationError();
-  }
-  if (typeof repositoryName !== 'string' || !REPOSITORY_NAME_PATTERN.test(repositoryName)) {
-    throw configurationError();
-  }
-  if (typeof branchRef !== 'string' || !BRANCH_REF_PATTERN.test(branchRef)) {
-    throw configurationError();
-  }
+  const dynamic = typeof resolveTarget === 'function';
+  if (!dynamic && (!Number.isSafeInteger(repositoryId) || repositoryId <= 0 ||
+      typeof repositoryName !== 'string' || !REPOSITORY_NAME_PATTERN.test(repositoryName) ||
+      typeof branchRef !== 'string' || !BRANCH_REF_PATTERN.test(branchRef))) throw configurationError();
+  if (installationId !== undefined && (!Number.isSafeInteger(installationId) || installationId <= 0)) throw configurationError();
 
   const maxBodyBytes = configuration.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
   if (!Number.isSafeInteger(maxBodyBytes) || maxBodyBytes <= 0 || maxBodyBytes > MAX_CONFIGURED_BODY_BYTES) {
@@ -49,6 +45,8 @@ function validateConfiguration(configuration) {
     repositoryId,
     repositoryName,
     branchRef,
+    resolveTarget,
+    installationId,
     maxBodyBytes,
   });
 }
@@ -156,23 +154,33 @@ function validatePayload(payload, headers, configuration) {
 
   const repository = payload.repository;
   if (!repository || typeof repository !== 'object' || Array.isArray(repository) ||
-      repository.id !== configuration.repositoryId ||
-      repository.full_name !== configuration.repositoryName) {
+      !Number.isSafeInteger(repository.id) || repository.id <= 0 ||
+      typeof repository.full_name !== 'string' || !REPOSITORY_NAME_PATTERN.test(repository.full_name)) {
     reject('repository_not_allowed', 403);
   }
-  if (payload.ref !== configuration.branchRef) reject('branch_not_allowed', 403);
+  if (typeof payload.ref !== 'string' || !BRANCH_REF_PATTERN.test(payload.ref)) reject('branch_not_allowed', 403);
   if (payload.deleted !== false) reject('deleted_ref_not_allowed', 400);
   if (typeof payload.after !== 'string' || !COMMIT_SHA_PATTERN.test(payload.after)) {
     reject('invalid_commit_sha', 400);
   }
   if (/^0+$/.test(payload.after)) reject('invalid_commit_sha', 400);
 
+  if (!configuration.resolveTarget && (repository.id !== configuration.repositoryId ||
+      repository.full_name !== configuration.repositoryName)) {
+    reject('repository_not_allowed', 403);
+  }
+  if (!configuration.resolveTarget && payload.ref !== configuration.branchRef) reject('branch_not_allowed', 403);
+  const installationId = payload.installation?.id;
+  if (configuration.installationId !== undefined && installationId !== configuration.installationId) {
+    reject('installation_not_allowed', 403);
+  }
   return Object.freeze({
     deliveryId,
     repositoryId: repository.id,
     repositoryName: repository.full_name,
     branchRef: payload.ref,
     commitSha: payload.after.toLowerCase(),
+    ...(Number.isSafeInteger(installationId) ? { installationId } : {}),
   });
 }
 
@@ -220,6 +228,25 @@ export function createGitHubPushVerifier(configuration) {
       reject('invalid_json', 400);
     }
 
-    return validatePayload(payload, request.headers, trusted);
+    const event = validatePayload(payload, request.headers, trusted);
+    if (trusted.resolveTarget) {
+      let target;
+      try {
+        target = await trusted.resolveTarget({
+          repositoryId: event.repositoryId,
+          repositoryName: event.repositoryName,
+          branchRef: event.branchRef,
+          installationId: event.installationId,
+        });
+      } catch {
+        reject('target_lookup_failed', 503);
+      }
+      if (!target || target.status !== 'active' || target.repositoryId !== event.repositoryId ||
+          target.repositoryName !== event.repositoryName || target.branchRef !== event.branchRef ||
+          (target.installationId !== undefined && target.installationId !== event.installationId)) {
+        reject('repository_not_allowed', 403);
+      }
+    }
+    return event;
   };
 }
