@@ -62,6 +62,33 @@ function rejectAndClose(request, response, statusCode, result) {
   sendJson(response, statusCode, result, true);
 }
 
+/** Drain an event UDA does not consume without buffering or trusting its body. */
+function acknowledgeUnsupportedEvent(request, response, maxBodyBytes) {
+  let totalBytes = 0;
+  let settled = false;
+  const finish = (statusCode, body, close = false) => {
+    if (settled) return;
+    settled = true;
+    request.removeListener('data', onData);
+    request.removeListener('end', onEnd);
+    request.removeListener('error', onError);
+    request.removeListener('aborted', onError);
+    if (close) rejectAndClose(request, response, statusCode, body);
+    else sendJson(response, statusCode, body);
+  };
+  const onData = chunk => {
+    totalBytes += chunk.byteLength;
+    if (totalBytes > maxBodyBytes) finish(413, { accepted: false, error: 'payload_too_large' }, true);
+  };
+  const onEnd = () => finish(202, { accepted: true, ignored: true });
+  const onError = () => finish(400, { accepted: false, error: 'request_body_unreadable' }, true);
+  request.on('data', onData);
+  request.once('end', onEnd);
+  request.once('error', onError);
+  request.once('aborted', onError);
+  request.resume();
+}
+
 function verificationResponse(error) {
   if (error instanceof WebhookVerificationError) {
     return { statusCode: error.statusCode, body: { accepted: false, error: error.code } };
@@ -108,6 +135,12 @@ export function createGitHubWebhookReceiver({ pool, configuration, resolveTarget
 
     if (request.url !== WEBHOOK_PATH || request.method !== 'POST') {
       rejectAndClose(request, response, request.url === WEBHOOK_PATH ? 405 : 404, { accepted: false });
+      return;
+    }
+
+    const eventName = request.headers['x-github-event'];
+    if (typeof eventName === 'string' && eventName !== 'push') {
+      acknowledgeUnsupportedEvent(request, response, configuration.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES);
       return;
     }
 

@@ -198,20 +198,25 @@ test('acknowledges a redelivered delivery without creating a second job', async 
   assert.equal(pool.calls.filter(call => /INSERT INTO uda_deployment_jobs/.test(call.sql)).length, 1);
 });
 
-test('rejects invalid signatures and unsupported event types before database access', async t => {
-  for (const headers of [
-    { 'x-hub-signature-256': `sha256=${'0'.repeat(64)}` },
-    { 'x-github-event': 'issues' },
-  ]) {
-    await t.test(JSON.stringify(headers), async () => {
-      const pool = { async connect() { throw new Error('database should not be reached'); }, async query() { throw new Error('database should not be reached'); } };
-      await withServer(pool, async server => {
-        const result = await post(server, event(), headers);
-        assert.equal(result.statusCode, headers['x-github-event'] ? 400 : 401);
-        assert.equal(result.body.accepted, false);
-      });
-    });
-  }
+test('rejects invalid push signatures and acknowledges unsupported events without database access', async () => {
+  const pool = { async connect() { throw new Error('database should not be reached'); }, async query() { throw new Error('database should not be reached'); } };
+  await withServer(pool, async server => {
+    const invalid = await post(server, event(), { 'x-hub-signature-256': `sha256=${'0'.repeat(64)}` });
+    assert.equal(invalid.statusCode, 401);
+    assert.equal(invalid.body.accepted, false);
+
+    const ignored = await post(server, event(), { 'x-github-event': 'issues', 'x-hub-signature-256': 'invalid' });
+    assert.deepEqual(ignored, { statusCode: 202, body: { accepted: true, ignored: true } });
+  });
+});
+
+test('does not drain oversized unsupported event bodies', async () => {
+  const pool = { async connect() { throw new Error('database should not be reached'); }, async query() { throw new Error('database should not be reached'); } };
+  await withServer(pool, async server => {
+    const result = await post(server, event(), { 'x-github-event': 'issues' });
+    assert.equal(result.statusCode, 413);
+    assert.deepEqual(result.body, { accepted: false, error: 'payload_too_large' });
+  }, config({ maxBodyBytes: 16 }));
 });
 
 test('oversized requests receive 413 and do not reach the queue', async () => {

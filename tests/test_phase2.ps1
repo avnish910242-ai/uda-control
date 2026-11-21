@@ -11,7 +11,7 @@ $ignore=Get-Content -LiteralPath (Join-Path $root '.gitignore') -Raw -Encoding U
 $mapping=$config.projects | Where-Object name -CEQ 'AI Knowledge Vault'
 
 Assert ($config.projects.Count -eq 1 -and $mapping.repository -ceq 'avnish910242-ai/ai-knowledge-vault' -and $mapping.branch -ceq 'main') 'AI Knowledge Vault repository and branch are explicitly mapped'
-Assert ($mapping.renderServiceName -ceq 'ai-knowledge-vault' -and $mapping.renderOwnerId -match '^REPLACE_WITH_') 'Render service name is fixed and workspace ID remains a non-secret manual placeholder'
+Assert ($mapping.renderServiceName -ceq 'ai-knowledge-vault' -and $mapping.renderOwnerId -match '^tea-[a-z0-9]+$') 'Render service name and configured workspace owner ID match the deployment mapping'
 Assert ($mapping.runtime.type -ceq 'node' -and $mapping.build[0] -join ' ' -ceq 'npm run build' -and $mapping.install[0] -join ' ' -ceq 'npm ci' -and $mapping.test[0] -join ' ' -ceq 'npm run lint') 'Node validation commands match requested build configuration'
 
 Assert ($launcher -match 'gh.*api' -and $launcher -match 'branches/\$branch' -and $launcher -match 'commit\.sha') 'launcher resolves the latest remote branch commit from GitHub'
@@ -39,8 +39,8 @@ Assert ($actions -match 'deployment-result\.json' -and $actions -match 'renderSe
 Assert ($actions -notmatch '(?i)nova|/services/srv-[^`" ]+' -and $actions -notmatch '(?i)api\.render\.com/v1/services/srv-') 'workflow has no hardcoded or Nova service ID'
 Assert ($actions -notmatch '(?i)RENDER_API_TOKEN\s*[:=]\s*(rnd_|rnd_)') 'workflow contains no literal Render credential'
 
-Assert ($readme.Contains('.\deploy.ps1 -Project "AI Knowledge Vault"') -and $readme -match 'manually' -and $readme -match 'never.*pushes') 'README documents the single command and manual push model'
-Assert ($readme -match 'uda-production' -and $readme -match 'renderOwnerId' -and $readme -match 'exact-name lookup') 'README documents required setup and idempotent service resolution'
+Assert ($readme.Contains('npm run onboard') -and $readme -match 'manually' -and $readme -match 'never.*pushes') 'README documents current onboarding and manual push model'
+Assert ($readme -match 'UDA_RENDER_OWNER_ID' -and $readme -match 'owner ID' -and $readme -match 'exact-name lookup') 'README documents required Render workspace setup and idempotent service resolution'
 Assert ($agents -match 'SEASHOP' -and $agents -match 'C:\\AI-Agent' -and $agents -match 'All existing n8n workflows, credentials, settings, and Docker volumes') 'protected-resource restrictions remain in force'
 Assert ($ignore -match '(?m)^\.uda/projects\.json$' -and $ignore -match '(?m)^\.env\.\*$') 'local registry and environment secrets remain ignored'
 
